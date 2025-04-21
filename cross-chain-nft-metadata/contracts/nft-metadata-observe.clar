@@ -810,3 +810,287 @@
         status: "executed"
       }))))))
 
+;; ---------- API Integration and Advanced Features ----------
+
+;; API usage tracking per user
+(define-map api-usage principal {
+  daily-requests: uint,
+  monthly-requests: uint,
+  last-reset-day: uint,
+  last-reset-month: uint
+})
+
+;; API rate limits per subscription tier
+(define-map tier-rate-limits uint {
+  daily-limit: uint,
+  monthly-limit: uint,
+  concurrent-requests: uint
+})
+
+;; Metadata standard registry
+(define-map metadata-standards uint {
+  name: (string-ascii 64),
+  schema: (string-ascii 255),
+  supported-chains: (list 10 uint),
+  created-by: principal,
+  created-at: uint,
+  active: bool
+})
+
+;; Standard counter
+(define-data-var standard-counter uint u0)
+
+;; Chain migration mappings
+(define-map chain-mappings {
+    source-chain: uint,
+    target-chain: uint,
+    source-contract: (string-ascii 64)
+  } {
+    target-contract: (string-ascii 64),
+    migration-status: (string-ascii 16),
+    migrated-count: uint
+})
+
+;; ---------- API Rate Limiting Functions ----------
+
+;; Track API usage
+(define-public (track-api-request (user principal))
+  (begin
+    (let ((current-day (/ block-height u144))  ;; Approximate day number
+          (current-month (/ block-height u4320)))  ;; Approximate month number
+      
+      (match (map-get? api-usage user)
+        existing-usage 
+          (if (is-eq (get last-reset-day existing-usage) current-day)
+            ;; Same day, increment counter
+            (map-set api-usage user (merge existing-usage {
+              daily-requests: (+ (get daily-requests existing-usage) u1),
+              monthly-requests: (+ (get monthly-requests existing-usage) u1)
+            }))
+            ;; New day, reset daily counter
+            (map-set api-usage user {
+              daily-requests: u1,
+              monthly-requests: (if (is-eq (get last-reset-month existing-usage) current-month)
+                                  (+ (get monthly-requests existing-usage) u1)
+                                  u1),
+              last-reset-day: current-day,
+              last-reset-month: (if (is-eq (get last-reset-month existing-usage) current-month)
+                                  (get last-reset-month existing-usage)
+                                  current-month)
+            }))
+        ;; New user
+        (map-set api-usage user {
+          daily-requests: u1,
+          monthly-requests: u1,
+          last-reset-day: current-day,
+          last-reset-month: current-month
+        })))
+    
+    (ok true)))
+
+;; Check if user is within rate limits
+(define-read-only (check-rate-limit (user principal))
+  (let ((tier (get-user-tier user))
+        (usage (default-to 
+                { 
+                  daily-requests: u0, 
+                  monthly-requests: u0, 
+                  last-reset-day: u0, 
+                  last-reset-month: u0 
+                } 
+                (map-get? api-usage user)))
+        (limits (default-to 
+                { 
+                  daily-limit: u0, 
+                  monthly-limit: u0, 
+                  concurrent-requests: u0 
+                } 
+                (map-get? tier-rate-limits tier))))
+    
+    (and (<= (get daily-requests usage) (get daily-limit limits))
+         (<= (get monthly-requests usage) (get monthly-limit limits)))))
+
+;; Set rate limits for a tier
+(define-public (set-rate-limits 
+  (tier uint) 
+  (daily-limit uint) 
+  (monthly-limit uint)
+  (concurrent-requests uint))
+  (begin
+    (asserts! (or (is-contract-owner) (is-contract-admin)) ERR_UNAUTHORIZED)
+    (ok (map-set tier-rate-limits tier {
+      daily-limit: daily-limit,
+      monthly-limit: monthly-limit,
+      concurrent-requests: concurrent-requests
+    }))))
+
+;; ---------- Metadata Standard Functions ----------
+
+;; Register a new metadata standard
+(define-public (register-metadata-standard 
+  (name (string-ascii 64))
+  (schema (string-ascii 255))
+  (supported-chains (list 10 uint)))
+  (begin
+    ;; Only premium or enterprise subscribers can register standards
+    (asserts! (>= (get-user-tier tx-sender) TIER_PREMIUM) ERR_UNAUTHORIZED)
+    (asserts! (has-active-subscription tx-sender) ERR_UNAUTHORIZED)
+    
+    ;; Validate all chains in the list
+    (asserts! (fold check-chain-exists supported-chains true) ERR_INVALID_CHAIN)
+    
+    ;; Increment standard counter
+    (var-set standard-counter (+ (var-get standard-counter) u1))
+    
+    ;; Register the standard
+    (ok (map-set metadata-standards (var-get standard-counter) {
+      name: name,
+      schema: schema,
+      supported-chains: supported-chains,
+      created-by: tx-sender,
+      created-at: block-height,
+      active: true
+    }))))
+
+;; Helper function to check if a chain exists
+(define-private (check-chain-exists (chain-id uint) (previous-result bool))
+  (and previous-result (is-some (map-get? chains chain-id))))
+
+;; Update metadata standard (creator or admin only)
+(define-public (update-metadata-standard 
+  (standard-id uint)
+  (schema (string-ascii 255))
+  (supported-chains (list 10 uint)))
+  (let ((standard (unwrap! (map-get? metadata-standards standard-id) ERR_NOT_FOUND)))
+    ;; Only creator or admin can update
+    (asserts! (or 
+      (is-eq tx-sender (get created-by standard))
+      (is-contract-admin)
+      (is-contract-owner)) 
+      ERR_UNAUTHORIZED)
+    
+    ;; Validate all chains in the list
+    (asserts! (fold check-chain-exists supported-chains true) ERR_INVALID_CHAIN)
+    
+    ;; Update the standard
+    (ok (map-set metadata-standards standard-id (merge standard {
+      schema: schema,
+      supported-chains: supported-chains
+    })))))
+
+;; Get metadata standard by ID
+(define-read-only (get-metadata-standard (standard-id uint))
+  (map-get? metadata-standards standard-id))
+
+;; ---------- Chain Migration Functions ----------
+
+;; Register a chain mapping for NFT migrations
+(define-public (register-chain-mapping 
+  (source-chain uint)
+  (target-chain uint)
+  (source-contract (string-ascii 64))
+  (target-contract (string-ascii 64)))
+  (begin
+    ;; Only enterprise subscribers can register chain mappings
+    (asserts! (is-eq (get-user-tier tx-sender) TIER_ENTERPRISE) ERR_UNAUTHORIZED)
+    (asserts! (has-active-subscription tx-sender) ERR_UNAUTHORIZED)
+    
+    ;; Validate chains
+    (asserts! (is-chain-active source-chain) ERR_INVALID_CHAIN)
+    (asserts! (is-chain-active target-chain) ERR_INVALID_CHAIN)
+    
+    ;; Register the mapping
+    (ok (map-set chain-mappings 
+      { 
+        source-chain: source-chain, 
+        target-chain: target-chain, 
+        source-contract: source-contract 
+      } 
+      {
+        target-contract: target-contract,
+        migration-status: "pending",
+        migrated-count: u0
+      }))))
+
+;; Record a successful NFT migration
+(define-public (record-nft-migration
+  (source-chain uint)
+  (target-chain uint)
+  (source-contract (string-ascii 64))
+  (source-token-id (string-ascii 64))
+  (target-token-id (string-ascii 64)))
+  (begin
+    ;; Only authorized oracles can record migrations
+    (asserts! (is-authorized-oracle tx-sender) ERR_UNAUTHORIZED)
+    
+    ;; Check if mapping exists
+    (let ((mapping (unwrap! (map-get? chain-mappings 
+                            { 
+                              source-chain: source-chain, 
+                              target-chain: target-chain, 
+                              source-contract: source-contract 
+                            }) 
+                          ERR_NOT_FOUND))
+          (source-nft-id { 
+            chain-id: source-chain, 
+            contract-address: source-contract, 
+            token-id: source-token-id 
+          })
+          (target-nft-id { 
+            chain-id: target-chain, 
+            contract-address: (get target-contract mapping), 
+            token-id: target-token-id 
+          }))
+      
+      ;; Check if source NFT exists
+      (asserts! (is-some (map-get? nft-registry source-nft-id)) ERR_NOT_FOUND)
+      (let ((source-data (unwrap! (map-get? nft-registry source-nft-id) ERR_NOT_FOUND)))
+        ;; Register target NFT with source metadata
+        (map-set nft-registry target-nft-id {
+          metadata-uri: (get metadata-uri source-data),
+          metadata-hash: (get metadata-hash source-data),
+          registered-by: tx-sender,
+          verified: true,
+          verified-by: (some tx-sender),
+          last-updated: block-height,
+          version: u1
+        })
+        
+        ;; Update migration count
+        (ok (map-set chain-mappings 
+          { 
+            source-chain: source-chain, 
+            target-chain: target-chain, 
+            source-contract: source-contract 
+          } 
+          (merge mapping {
+            migration-status: "active",
+            migrated-count: (+ u1 (get migrated-count mapping))
+          })))))))
+
+;; ---------- Initialize API Rate Limits ----------
+
+;; Initialize rate limits for each tier
+(map-set tier-rate-limits TIER_FREE {
+  daily-limit: u100,
+  monthly-limit: u1000,
+  concurrent-requests: u2
+})
+
+(map-set tier-rate-limits TIER_BASIC {
+  daily-limit: u1000,
+  monthly-limit: u10000,
+  concurrent-requests: u5
+})
+
+(map-set tier-rate-limits TIER_PREMIUM {
+  daily-limit: u10000,
+  monthly-limit: u100000,
+  concurrent-requests: u20
+})
+
+(map-set tier-rate-limits TIER_ENTERPRISE {
+  daily-limit: u100000,
+  monthly-limit: u1000000,
+  concurrent-requests: u50
+})
