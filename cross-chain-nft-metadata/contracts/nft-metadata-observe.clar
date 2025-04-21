@@ -428,3 +428,187 @@
                       token-id: token-id 
                     }))))
     (get verified nft-data)))
+
+;; ---------- Cross-Chain Bridge Interface ----------
+
+;; Cross-chain message structure for bridge communication
+(define-map bridge-messages uint {
+  source-chain-id: uint,
+  target-chain-id: uint,
+  message-type: (string-ascii 32),
+  payload: (buff 1024),
+  status: (string-ascii 16),
+  txid: (buff 32),
+  created-at: uint,
+  processed-at: (optional uint)
+})
+
+;; Bridge message counter
+(define-data-var bridge-message-counter uint u0)
+
+;; Bridge protocol version
+(define-data-var bridge-protocol-version (string-ascii 16) "1.0.0")
+
+;; Bridge fee (in microSTX)
+(define-data-var bridge-fee uint u1000000) ;; 1 STX
+
+;; Submit metadata to external chain through bridge
+(define-public (submit-to-external-chain
+  (target-chain-id uint)
+  (contract-address (string-ascii 64))
+  (token-id (string-ascii 64))
+  (payload-data (buff 1024)))
+  (begin
+    ;; Check if the target chain is supported
+    (let ((chain (unwrap! (map-get? chains target-chain-id) ERR_INVALID_CHAIN)))
+      ;; Check if chain has a bridge contract configured
+      (asserts! (is-some (get bridge-contract chain)) ERR_INVALID_CHAIN)
+      ;; Check if chain is active
+      (asserts! (get active chain) ERR_INVALID_CHAIN)
+      
+      ;; Check if the STX fee is provided
+      (asserts! (>= (stx-get-balance tx-sender) (var-get bridge-fee)) ERR_UNAUTHORIZED)
+      
+      ;; Increment bridge message counter
+      (var-set bridge-message-counter (+ (var-get bridge-message-counter) u1))
+      
+      ;; Create bridge message
+      (map-set bridge-messages (var-get bridge-message-counter) {
+        source-chain-id: CHAIN_STACKS,
+        target-chain-id: target-chain-id,
+        message-type: "metadata-update",
+        payload: payload-data,
+        status: "pending",
+        txid: (sha256 payload-data), ;; Simplified transaction ID
+        created-at: block-height,
+        processed-at: none
+      })
+      
+      ;; Charge the bridge fee
+      (try! (stx-transfer? (var-get bridge-fee) tx-sender CONTRACT_OWNER))
+      
+      (ok (var-get bridge-message-counter)))))
+
+;; Confirm bridge message processed on target chain
+(define-public (confirm-bridge-message
+  (message-id uint)
+  (target-chain-txid (buff 32))
+  (proof (buff 65)))
+  (begin
+    ;; Only contract admin or oracle can confirm bridge messages
+    (asserts! (or 
+      (is-contract-admin) 
+      (is-contract-owner)
+      (is-authorized-oracle tx-sender)) 
+      ERR_UNAUTHORIZED)
+      
+    (let ((message (unwrap! (map-get? bridge-messages message-id) ERR_NOT_FOUND)))
+      ;; Check if message is in pending state
+      (asserts! (is-eq (get status message) "pending") ERR_INVALID_TOKEN)
+      
+      ;; Verify the proof (simplified)
+      (asserts! (verify-bridge-proof proof target-chain-txid) ERR_INVALID_SIGNATURE)
+      
+      ;; Update message status
+      (ok (map-set bridge-messages message-id (merge message {
+        status: "completed",
+        processed-at: (some block-height)
+      }))))))
+
+;; Register incoming metadata from external chain
+(define-public (register-external-metadata
+  (source-chain-id uint)
+  (external-txid (buff 32))
+  (contract-address (string-ascii 64))
+  (token-id (string-ascii 64))
+  (metadata-uri (string-ascii 255))
+  (metadata-hash (buff 32))
+  (proof (buff 65)))
+  (begin
+    ;; Only authorized oracles can register external metadata
+    (asserts! (is-authorized-oracle tx-sender) ERR_UNAUTHORIZED)
+    
+    ;; Verify the external chain is supported
+    (asserts! (is-chain-active source-chain-id) ERR_INVALID_CHAIN)
+    
+    ;; Verify the proof (simplified)
+    (asserts! (verify-external-proof 
+      proof 
+      source-chain-id 
+      external-txid 
+      contract-address 
+      token-id) 
+      ERR_INVALID_SIGNATURE)
+    
+    ;; Register the NFT metadata with verified status
+    (let ((nft-id { 
+            chain-id: source-chain-id, 
+            contract-address: contract-address, 
+            token-id: token-id 
+          }))
+      (if (is-some (map-get? nft-registry nft-id))
+        ;; Update existing entry
+        (let ((existing-data (unwrap! (map-get? nft-registry nft-id) ERR_NOT_FOUND)))
+          (map-set nft-registry nft-id (merge existing-data {
+            metadata-uri: metadata-uri,
+            metadata-hash: metadata-hash,
+            verified: true,
+            verified-by: (some tx-sender),
+            last-updated: block-height,
+            version: (+ u1 (get version existing-data))
+          })))
+        ;; New registration
+        (map-set nft-registry nft-id {
+          metadata-uri: metadata-uri,
+          metadata-hash: metadata-hash,
+          registered-by: tx-sender,
+          verified: true,
+          verified-by: (some tx-sender),
+          last-updated: block-height,
+          version: u1
+        }))
+      
+      ;; Return the transaction hash to track this update
+      (ok external-txid))))
+
+;; Set bridge fee
+(define-public (set-bridge-fee (new-fee uint))
+  (begin
+    (asserts! (or (is-contract-owner) (is-contract-admin)) ERR_UNAUTHORIZED)
+    (ok (var-set bridge-fee new-fee))))
+
+;; Get bridge fee
+(define-read-only (get-bridge-fee)
+  (var-get bridge-fee))
+
+;; Get bridge protocol version
+(define-read-only (get-bridge-protocol-version)
+  (var-get bridge-protocol-version))
+
+;; Update bridge protocol version (admin only)
+(define-public (update-bridge-protocol-version (new-version (string-ascii 16)))
+  (begin
+    (asserts! (or (is-contract-owner) (is-contract-admin)) ERR_UNAUTHORIZED)
+    (ok (var-set bridge-protocol-version new-version))))
+
+;; Get bridge message by ID
+(define-read-only (get-bridge-message (message-id uint))
+  (map-get? bridge-messages message-id))
+
+;; Simplified bridge proof verification
+;; In production, this would use proper cryptographic verification
+(define-private (verify-bridge-proof (proof (buff 65)) (txid (buff 32)))
+  (and (is-eq (len proof) u65) (> (len txid) u0)))
+
+;; Simplified external proof verification
+;; In production, this would verify the proof against the source chain
+(define-private (verify-external-proof 
+  (proof (buff 65)) 
+  (source-chain-id uint)
+  (txid (buff 32))
+  (contract-address (string-ascii 64))
+  (token-id (string-ascii 64)))
+  (and 
+    (is-eq (len proof) u65) 
+    (> (len txid) u0)
+    (is-chain-active source-chain-id)))
