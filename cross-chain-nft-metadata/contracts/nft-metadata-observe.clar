@@ -23,6 +23,13 @@
 (define-constant CHAIN_SOLANA u4)
 (define-constant CHAIN_AVALANCHE u5)
 
+
+;; Initialize subscription prices
+(map-set subscription-prices TIER_FREE u0)          ;; Free tier: 0 STX
+(map-set subscription-prices TIER_BASIC u10000000)  ;; Basic tier: 10 STX
+(map-set subscription-prices TIER_PREMIUM u50000000) ;; Premium tier: 50 STX
+(map-set subscription-prices TIER_ENTERPRISE u100000000) ;; Enterprise tier: 100 STX
+
 ;; ---------- Data Structures ----------
 
 ;; Chain Registry - keeps track of supported chains
@@ -612,3 +619,194 @@
     (is-eq (len proof) u65) 
     (> (len txid) u0)
     (is-chain-active source-chain-id)))
+
+;; ---------- Subscription and Governance System ----------
+
+;; Subscription tiers
+(define-constant TIER_FREE u0)
+(define-constant TIER_BASIC u1)
+(define-constant TIER_PREMIUM u2)
+(define-constant TIER_ENTERPRISE u3)
+
+;; Subscription prices (in microSTX)
+(define-map subscription-prices uint uint)
+
+;; User subscriptions
+(define-map user-subscriptions principal {
+  tier: uint,
+  start-block: uint,
+  end-block: uint,
+  auto-renew: bool
+})
+
+;; Governance proposals
+(define-map governance-proposals uint {
+  title: (string-ascii 64),
+  description: (string-ascii 255),
+  proposed-by: principal,
+  status: (string-ascii 16),
+  created-at: uint,
+  expires-at: uint,
+  votes-for: uint,
+  votes-against: uint,
+  execution-params: (optional (buff 1024))
+})
+
+;; Governance votes
+(define-map governance-votes 
+  { proposal-id: uint, voter: principal } 
+  { vote: bool, weight: uint }
+)
+
+;; Proposal counter
+(define-data-var proposal-counter uint u0)
+
+;; ---------- Subscription Functions ----------
+
+;; Subscribe to a tier
+(define-public (subscribe (tier uint) (duration uint) (auto-renew bool))
+  (begin
+    ;; Check if tier exists
+    (asserts! (is-some (map-get? subscription-prices tier)) ERR_INVALID_TOKEN)
+    ;; Calculate subscription cost
+    (let ((price (unwrap! (map-get? subscription-prices tier) ERR_INVALID_TOKEN))
+          (total-cost (* price duration)))
+      ;; Check if user has enough STX
+      (asserts! (>= (stx-get-balance tx-sender) total-cost) ERR_UNAUTHORIZED)
+      
+      ;; Process payment
+      (try! (stx-transfer? total-cost tx-sender CONTRACT_OWNER))
+      
+      ;; Update or create subscription
+      (ok (map-set user-subscriptions tx-sender {
+        tier: tier,
+        start-block: block-height,
+        end-block: (+ block-height (* duration u144)), ;; Approx. blocks per 24h * days
+        auto-renew: auto-renew
+      })))))
+
+;; Get user subscription
+(define-read-only (get-user-subscription (user principal))
+  (map-get? user-subscriptions user))
+
+;; Check if user has active subscription
+(define-read-only (has-active-subscription (user principal))
+  (match (map-get? user-subscriptions user)
+    subscription (>= (get end-block subscription) block-height)
+    false))
+
+;; Get subscription tier
+(define-read-only (get-user-tier (user principal))
+  (let ((subscription (default-to 
+                        { tier: TIER_FREE, start-block: u0, end-block: u0, auto-renew: false }
+                        (map-get? user-subscriptions user))))
+    (get tier subscription)))
+
+;; Set subscription price (admin only)
+(define-public (set-subscription-price (tier uint) (price uint))
+  (begin
+    (asserts! (or (is-contract-owner) (is-contract-admin)) ERR_UNAUTHORIZED)
+    (ok (map-set subscription-prices tier price))))
+
+;; Cancel subscription
+(define-public (cancel-subscription)
+  (begin
+    (asserts! (is-some (map-get? user-subscriptions tx-sender)) ERR_NOT_FOUND)
+    (let ((subscription (unwrap! (map-get? user-subscriptions tx-sender) ERR_NOT_FOUND)))
+      (ok (map-set user-subscriptions tx-sender (merge subscription {
+        auto-renew: false
+      }))))))
+
+;; ---------- Governance Functions ----------
+
+;; Create a new governance proposal
+(define-public (create-proposal 
+  (title (string-ascii 64)) 
+  (description (string-ascii 255))
+  (duration uint)
+  (execution-params (optional (buff 1024))))
+  (begin
+    ;; Only subscribers above FREE tier can create proposals
+    (asserts! (> (get-user-tier tx-sender) TIER_FREE) ERR_UNAUTHORIZED)
+    (asserts! (has-active-subscription tx-sender) ERR_UNAUTHORIZED)
+    
+    ;; Increment proposal counter
+    (var-set proposal-counter (+ (var-get proposal-counter) u1))
+    
+    ;; Create new proposal
+    (ok (map-set governance-proposals (var-get proposal-counter) {
+      title: title,
+      description: description,
+      proposed-by: tx-sender,
+      status: "active",
+      created-at: block-height,
+      expires-at: (+ block-height (* duration u144)), ;; Approx. blocks per 24h * days
+      votes-for: u0,
+      votes-against: u0,
+      execution-params: execution-params
+    }))))
+
+;; Vote on a governance proposal
+(define-public (vote-on-proposal (proposal-id uint) (vote bool))
+  (let ((proposal (unwrap! (map-get? governance-proposals proposal-id) ERR_NOT_FOUND)))
+    ;; Check if proposal is active
+    (asserts! (is-eq (get status proposal) "active") ERR_INVALID_TOKEN)
+    ;; Check if proposal has not expired
+    (asserts! (<= block-height (get expires-at proposal)) ERR_EXPIRED)
+    ;; Check if user has active subscription
+    (asserts! (has-active-subscription tx-sender) ERR_UNAUTHORIZED)
+    
+    ;; Calculate vote weight based on tier
+    (let ((vote-weight (pow u2 (get-user-tier tx-sender))))
+      ;; Check if user has already voted
+      (match (map-get? governance-votes { proposal-id: proposal-id, voter: tx-sender })
+        previous-vote 
+          ;; Update existing vote
+          (begin
+            ;; Adjust vote counts
+            (map-set governance-proposals proposal-id 
+              (merge proposal {
+                votes-for: (if vote 
+                              (+ (get votes-for proposal) vote-weight)
+                              (get votes-for proposal)),
+                votes-against: (if vote 
+                                  (get votes-against proposal)
+                                  (+ (get votes-against proposal) vote-weight))
+              }))
+            (ok (map-set governance-votes 
+                  { proposal-id: proposal-id, voter: tx-sender }
+                  { vote: vote, weight: vote-weight })))
+        ;; First vote from this user
+        (begin
+          ;; Adjust vote counts
+          (map-set governance-proposals proposal-id 
+            (merge proposal {
+              votes-for: (if vote 
+                            (+ (get votes-for proposal) vote-weight)
+                            (get votes-for proposal)),
+              votes-against: (if vote 
+                                (get votes-against proposal)
+                                (+ (get votes-against proposal) vote-weight))
+            }))
+          (ok (map-set governance-votes 
+                { proposal-id: proposal-id, voter: tx-sender }
+                { vote: vote, weight: vote-weight })))))))
+
+;; Execute a passed proposal (admin only)
+(define-public (execute-proposal (proposal-id uint))
+  (begin
+    (asserts! (or (is-contract-owner) (is-contract-admin)) ERR_UNAUTHORIZED)
+    (let ((proposal (unwrap! (map-get? governance-proposals proposal-id) ERR_NOT_FOUND)))
+      ;; Check if proposal is active and expired (voting period over)
+      (asserts! (and (is-eq (get status proposal) "active")
+                    (> block-height (get expires-at proposal))) 
+                ERR_INVALID_TOKEN)
+      
+      ;; Check if proposal passed (more votes for than against)
+      (asserts! (> (get votes-for proposal) (get votes-against proposal)) ERR_UNAUTHORIZED)
+      
+      ;; Update proposal status
+      (ok (map-set governance-proposals proposal-id (merge proposal {
+        status: "executed"
+      }))))))
+
