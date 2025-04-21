@@ -289,3 +289,142 @@
           }))
       (asserts! (is-some (map-get? nft-registry nft-id)) ERR_NOT_FOUND)
       (ok (map-delete nft-registry nft-id)))))
+
+
+;; ---------- Verification System ----------
+
+;; Create a verification request
+(define-public (request-verification
+  (chain-id uint)
+  (contract-address (string-ascii 64))
+  (token-id (string-ascii 64))
+  (oracle principal))
+  (begin
+    ;; Check if the NFT is registered
+    (let ((nft-id { 
+            chain-id: chain-id, 
+            contract-address: contract-address, 
+            token-id: token-id 
+          }))
+      (asserts! (is-some (map-get? nft-registry nft-id)) ERR_NOT_FOUND)
+      ;; Check if the oracle is authorized
+      (asserts! (is-authorized-oracle oracle) ERR_UNAUTHORIZED)
+      ;; Increment request counter
+      (var-set request-counter (+ (var-get request-counter) u1))
+      ;; Create verification request with expiration (100 blocks from now)
+      (ok (map-set verification-requests (var-get request-counter) {
+        chain-id: chain-id,
+        contract-address: contract-address,
+        token-id: token-id,
+        requested-by: tx-sender,
+        oracle: oracle,
+        status: "pending",
+        created-at: block-height,
+        expires-at: (+ block-height u100)
+      })))))
+
+;; Get verification request by ID
+(define-read-only (get-verification-request (request-id uint))
+  (map-get? verification-requests request-id))
+
+;; Get current request counter
+(define-read-only (get-request-counter)
+  (var-get request-counter))
+
+;; Fulfill verification request (called by oracle)
+(define-public (verify-nft-metadata
+  (request-id uint)
+  (is-valid bool)
+  (signature (buff 65)))
+  (let ((request (unwrap! (map-get? verification-requests request-id) ERR_NOT_FOUND)))
+    ;; Check if caller is the assigned oracle
+    (asserts! (is-eq tx-sender (get oracle request)) ERR_UNAUTHORIZED)
+    ;; Check if request is pending
+    (asserts! (is-eq (get status request) "pending") ERR_INVALID_TOKEN)
+    ;; Check if request is not expired
+    (asserts! (<= block-height (get expires-at request)) ERR_EXPIRED)
+    
+    ;; Verify the signature (simplified, in practice would validate with chain-specific logic)
+    (asserts! (verify-signature-format signature) ERR_INVALID_SIGNATURE)
+    
+    ;; Get the NFT data
+    (let ((nft-id { 
+            chain-id: (get chain-id request), 
+            contract-address: (get contract-address request), 
+            token-id: (get token-id request) 
+          })
+          (nft-data (unwrap! (map-get? nft-registry nft-id) ERR_NOT_FOUND))
+          (oracle-data (unwrap! (map-get? authorized-oracles tx-sender) ERR_UNAUTHORIZED)))
+      
+      ;; Update verification request status
+      (map-set verification-requests request-id (merge request {
+        status: (if is-valid "verified" "rejected")
+      }))
+      
+      ;; Update oracle verification count
+      (map-set authorized-oracles tx-sender (merge oracle-data {
+        verification-count: (+ u1 (get verification-count oracle-data))
+      }))
+      
+      ;; Update NFT verification status if valid
+      (if is-valid
+        (map-set nft-registry nft-id (merge nft-data {
+          verified: true,
+          verified-by: (some tx-sender)
+        }))
+        false)
+      
+      (ok is-valid))))
+
+;; Cancel verification request (by requester or admin)
+(define-public (cancel-verification-request (request-id uint))
+  (let ((request (unwrap! (map-get? verification-requests request-id) ERR_NOT_FOUND)))
+    ;; Only original requester or admin can cancel
+    (asserts! (or 
+      (is-eq tx-sender (get requested-by request))
+      (is-contract-admin)
+      (is-contract-owner)) 
+      ERR_UNAUTHORIZED)
+    ;; Check if request is pending
+    (asserts! (is-eq (get status request) "pending") ERR_INVALID_TOKEN)
+    
+    ;; Update status to cancelled
+    (ok (map-set verification-requests request-id (merge request {
+      status: "cancelled"
+    })))))
+
+;; Simple signature format verification (placeholder)
+;; In production, this would perform proper cryptographic validation
+(define-private (verify-signature-format (signature (buff 65)))
+  (is-eq (len signature) u65))
+
+;; Get all verification requests for a specific NFT
+(define-read-only (get-verification-history
+  (chain-id uint)
+  (contract-address (string-ascii 64))
+  (token-id (string-ascii 64)))
+  ;; Note: In practice, this would require off-chain indexing
+  ;; This is a placeholder function that would rely on event indexing
+  (ok { chain-id: chain-id, total-verifications: u0 }))
+
+;; Check if an NFT is verified
+(define-read-only (is-nft-verified
+  (chain-id uint)
+  (contract-address (string-ascii 64))
+  (token-id (string-ascii 64)))
+  (let ((nft-data (default-to 
+                    { 
+                      metadata-uri: "", 
+                      metadata-hash: 0x, 
+                      registered-by: CONTRACT_OWNER, 
+                      verified: false, 
+                      verified-by: none, 
+                      last-updated: u0, 
+                      version: u0 
+                    }
+                    (map-get? nft-registry { 
+                      chain-id: chain-id, 
+                      contract-address: contract-address, 
+                      token-id: token-id 
+                    }))))
+    (get verified nft-data)))
